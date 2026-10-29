@@ -1,39 +1,129 @@
+# Environment-specific values are Cloud Build substitutions (override per trigger).
+# Production GCP (master): defaults below.
+# Staging GCP (dev-feature): override in the trigger — see README "Deploy".
+#
+# Prerequisite: Secret Manager secrets (same id as env var name):
+#   FIREBASE_PROJECT_ID, FIREBASE_PRIVATE_KEY, FIREBASE_CLIENT_EMAIL,
+#   FIREBASE_DATABASE_URL, FIREBASE_WEB_API_KEY, GITHUB_TOKEN
+#
+# Deploy:
+#   gcloud builds submit --config cloudbuild.yaml --project=nxt-acad-hackathon
+
 substitutions:
   _REGION: us-central1
-  _SERVICE: github-analyser
-  _GCS_BUCKET: ""
-  _VERTEX_MODEL: gemini-2.0-flash
+  _ENVIRONMENT: production
+  # Vertex AI (non-secret). GITHUB_TOKEN + FIREBASE_* from Secret Manager.
+  _GCP_LOCATION: us-central1
+  _GEMINI_MODEL: gemini-2.5-flash
+  _FIRESTORE_COLLECTION: github_analysis_jobs
+  _WORKER_JOB: github-analyser-worker
+  # Cloud Run runtime SA — same project as this Cloud Build (must have Secret Manager access).
+  # Do not use nxt-acad-ai-hackathon-evaluator@nxt-create-deb (different project → actAs denied).
+  _RUN_SERVICE_ACCOUNT: github-analyser-sa@github-analyser-786.iam.gserviceaccount.com
 
 steps:
+  # Step 1: Ensure Artifact Registry repository exists (required before first push)
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        gcloud artifacts repositories describe github-analyser \
+          --location=${_REGION} \
+          --project=$PROJECT_ID 2>/dev/null \
+          || gcloud artifacts repositories create github-analyser \
+            --repository-format=docker \
+            --location=${_REGION} \
+            --description="Docker repository for GitHub Analyser" \
+            --project=$PROJECT_ID
+
+  # Step 2: Build Docker image
   - name: gcr.io/cloud-builders/docker
     args:
       - build
       - -t
-      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/${_SERVICE}:$SHORT_SHA
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/github-analyser/github-analyser:$BUILD_ID
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/github-analyser/github-analyser:$SHORT_SHA
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/github-analyser/github-analyser:latest
       - .
 
+  # Step 3: Push image to Artifact Registry
   - name: gcr.io/cloud-builders/docker
     args:
       - push
-      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/${_SERVICE}:$SHORT_SHA
+      - --all-tags
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/github-analyser/github-analyser
 
+  # Step 4: Deploy Cloud Run Job (worker) then Cloud Run Service (API)
   - name: gcr.io/google.com/cloudsdktool/cloud-sdk
-    entrypoint: gcloud
+    entrypoint: bash
     args:
-      - run
-      - deploy
-      - ${_SERVICE}
-      - --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/${_SERVICE}:$SHORT_SHA
-      - --region=${_REGION}
-      - --platform=managed
-      - --allow-unauthenticated
-      - --memory=1Gi
-      - --cpu=1
-      - --timeout=300
-      - --set-env-vars=GCP_PROJECT_ID=$PROJECT_ID,GCP_LOCATION=${_REGION},GCS_BUCKET=${_GCS_BUCKET},VERTEX_MODEL=${_VERTEX_MODEL},VERTEX_ENABLED=true,HOST=0.0.0.0
+      - -c
+      - |
+        set -euo pipefail
+        IMAGE=${_REGION}-docker.pkg.dev/$PROJECT_ID/github-analyser/github-analyser:$BUILD_ID
+        SECRETS=FIREBASE_PROJECT_ID=FIREBASE_PROJECT_ID:latest,FIREBASE_PRIVATE_KEY=FIREBASE_PRIVATE_KEY:latest,FIREBASE_CLIENT_EMAIL=FIREBASE_CLIENT_EMAIL:latest,FIREBASE_DATABASE_URL=FIREBASE_DATABASE_URL:latest,FIREBASE_WEB_API_KEY=FIREBASE_WEB_API_KEY:latest,GITHUB_TOKEN=GITHUB_TOKEN:latest
+        SHARED_ENV=ENVIRONMENT=${_ENVIRONMENT},GOOGLE_CLOUD_PROJECT=$PROJECT_ID,GOOGLE_CLOUD_LOCATION=${_GCP_LOCATION},GEMINI_MODEL=${_GEMINI_MODEL},VERTEX_ENABLED=true,FIRESTORE_COLLECTION_JOBS=${_FIRESTORE_COLLECTION}
+
+        gcloud run jobs deploy ${_WORKER_JOB} \
+          --image="$$IMAGE" \
+          --region=${_REGION} \
+          --service-account=${_RUN_SERVICE_ACCOUNT} \
+          --command=/app/.venv/bin/python \
+          --args=-m,app.worker \
+          --memory=1Gi \
+          --cpu=1 \
+          --task-timeout=1200 \
+          --max-retries=2 \
+          --tasks=1 \
+          --parallelism=1 \
+          --update-secrets="$$SECRETS" \
+          --set-env-vars="$$SHARED_ENV,APP_ROLE=worker" \
+          --project=$PROJECT_ID
+
+        gcloud run jobs add-iam-policy-binding ${_WORKER_JOB} \
+          --region=${_REGION} \
+          --member="serviceAccount:${_RUN_SERVICE_ACCOUNT}" \
+          --role=roles/run.invoker \
+          --project=$PROJECT_ID \
+          --quiet
+
+        gcloud run deploy github-analyser \
+          --image="$$IMAGE" \
+          --region=${_REGION} \
+          --platform=managed \
+          --service-account=${_RUN_SERVICE_ACCOUNT} \
+          --allow-unauthenticated \
+          --port=8080 \
+          --memory=1Gi \
+          --cpu=1 \
+          --timeout=300 \
+          --concurrency=10 \
+          --min-instances=0 \
+          --max-instances=10 \
+          --update-secrets="$$SECRETS" \
+          --set-env-vars="$$SHARED_ENV,HOST=0.0.0.0,CLOUD_RUN_JOB_NAME=${_WORKER_JOB},CLOUD_RUN_JOBS_LOCATION=${_REGION}" \
+          --project=$PROJECT_ID
+
+        SERVICE_URL=$$(gcloud run services describe github-analyser \
+          --region=${_REGION} --project=$PROJECT_ID --format='value(status.url)')
+        echo "Deployed API: $$SERVICE_URL"
+        echo "Worker job: ${_WORKER_JOB} (runtime SA: ${_RUN_SERVICE_ACCOUNT})"
+    env:
+      - CLOUDSDK_COMPUTE_REGION=${_REGION}
 
 images:
-  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/${_SERVICE}:$SHORT_SHA
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/github-analyser/github-analyser:$BUILD_ID
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/github-analyser/github-analyser:$SHORT_SHA
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/github-analyser/github-analyser:latest
 
 options:
+  machineType: E2_HIGHCPU_8
   logging: CLOUD_LOGGING_ONLY
+
+timeout: 1800s
+
+# Cloud Build SA: roles/run.admin, roles/artifactregistry.writer,
+# roles/iam.serviceAccountUser on ${_RUN_SERVICE_ACCOUNT}

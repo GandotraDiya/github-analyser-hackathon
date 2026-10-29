@@ -1,0 +1,40 @@
+[project]
+name = "github-analyser-hackathon"
+version = "0.1.0"
+description = "Pluggable GitHub repo analysis for hackathon submissions"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "httpx>=0.27.0",
+    "pydantic>=2.9.0",
+    "pydantic-settings>=2.6.0",
+    "python-dotenv>=1.0.1",
+    "tenacity>=9.0.0",
+    "firebase-admin>=6.5.0",
+    "google-cloud-firestore>=2.19.0",
+    "google-genai>=1.0.0",
+    "tree-sitter>=0.26.0",
+    "tree-sitter-javascript>=0.25.0",
+    "tree-sitter-typescript>=0.23.2",
+    "networkx>=3.6.1",
+]
+
+[project.scripts]
+github-analyser = "app.__main__:main"
+github-analyser-worker = "app.worker:main"
+
+[dependency-groups]
+dev = ["pytest>=9.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

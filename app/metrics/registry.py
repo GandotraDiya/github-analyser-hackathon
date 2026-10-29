@@ -3,6 +3,7 @@ from __future__ import annotations
 from app.metrics.agent_analysis import AgentAnalysisMetric
 from app.metrics.ai_usage import AiUsageMetric
 from app.metrics.base import Metric
+from app.metrics.frontend_backend import FrontendBackendMetric
 from app.metrics.fullstack import FullstackMetric
 from app.metrics.repo_health import RepoHealthMetric
 from app.metrics.solution_fit import SolutionFitMetric
@@ -20,6 +21,7 @@ def init_registry() -> None:
     for metric in (
         RepoHealthMetric(),
         FullstackMetric(),
+        FrontendBackendMetric(),
         AiUsageMetric(),
         AgentAnalysisMetric(),
         SolutionFitMetric(),
@@ -44,17 +46,11 @@ def default_metric_names() -> list[str]:
 
 
 def resolve_requested(metrics: list[str] | None) -> list[str]:
-    """Resolve request metrics: None → all selectable; always include always-on."""
+    """Hardcoded: always evaluate every selectable metric (+ always-on). Request list is ignored."""
+    del metrics  # reserved for future selective evaluation
     init_registry()
     always = [m.name for m in _REGISTRY.values() if m.always_on]
-    selectable = default_metric_names()
-    if metrics is None:
-        chosen = list(selectable)
-    else:
-        unknown = [m for m in metrics if m not in _REGISTRY]
-        if unknown:
-            raise ValueError(f"Unknown metrics: {unknown}. Available: {list(_REGISTRY)}")
-        chosen = list(dict.fromkeys(metrics))
+    chosen = list(default_metric_names())
     for name in always:
         if name not in chosen:
             chosen.append(name)
